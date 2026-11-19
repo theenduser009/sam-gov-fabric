@@ -2,7 +2,15 @@
 
 The pipeline calls one Fabric Notebook activity. The notebook requests an Award CSV extract and an IDV CSV extract from SAM.gov, polls for downloads, and writes the response files to its default Lakehouse under `Files/raw/sam/contract-awards`. A run is complete when both files and `_SUCCESS.json` are present.
 
-## Set up and run
+## Copy and run in Fabric
+
+1. Open a PySpark notebook in the workspace containing `PLN_SAM_GOV_FABRIC`. Attach the intended destination Lakehouse as this notebook's default.
+2. Copy [install-in-fabric.py](install-in-fabric.py) into one code cell and run it as a user who can create notebooks and edit the pipeline. It finds the pipeline by its exact name, creates the loader notebook, wires its activity into the existing pipeline, and prints the complete JSON it reads back from Fabric.
+3. Reload the pipeline and select **Run**. Enter the signed start and end dates and the Key Vault URL. The vault secret defaults to `sam-gov-api-key`. The run identity needs permission to read it and write to the Lakehouse.
+
+The installer accepts a blank pipeline, the inactive `Set variable1` draft, or a pipeline already using its loader activity. It checks for a changed definition before updating and does not start an ingestion run.
+
+## Manual setup using the JSON templates
 
 1. In the target Fabric workspace, import `sam-contract-awards.ipynb` as a PySpark notebook and attach the destination Lakehouse as its default. Mark the configuration cell as the parameter cell if Fabric does not retain that designation.
 2. Store the SAM.gov API key in Azure Key Vault. Grant the notebook's run identity permission to get the secret and write to the Lakehouse. Do not put the key into the pipeline JSON.
