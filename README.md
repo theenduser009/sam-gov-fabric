@@ -1,21 +1,29 @@
-# SAM.gov contract ingestion for Microsoft Fabric
+# Run SAM.gov Awards and IDVs from a Fabric pipeline
 
-The pipeline calls one Fabric Notebook activity. The notebook requests an Award CSV extract and an IDV CSV extract from SAM.gov, polls for downloads, and writes the response files to its default Lakehouse under `Files/raw/sam/contract-awards`. A run is complete when both files and `_SUCCESS.json` are present.
+Run **`PLN_SAM_GOV_FABRIC`** manually in Microsoft Fabric. Its **Notebook** activity runs the PySpark code and lands separate Award and IDV extracts in OneLake.
 
-## Copy and run in Fabric
+## The two pieces
 
-1. Open a PySpark notebook in the workspace containing `PLN_SAM_GOV_FABRIC`. Attach the intended destination Lakehouse as this notebook's default.
-2. Copy [install-in-fabric.py](install-in-fabric.py) into one code cell and run it as a user who can create notebooks and edit the pipeline. It finds the pipeline by its exact name, creates the loader notebook, wires its activity into the existing pipeline, and prints the complete JSON it reads back from Fabric.
-3. Reload the pipeline and select **Run**. Enter the signed start and end dates and the Key Vault URL. The vault secret defaults to `sam-gov-api-key`. The run identity needs permission to read it and write to the Lakehouse.
+| File | Use |
+| --- | --- |
+| [sam-contract-awards.ipynb](sam-contract-awards.ipynb) | Import this Fabric notebook. [Python source](sam-contract-awards.py) is also available for copy and paste. |
+| [PLN_SAM_GOV_FABRIC.json](PLN_SAM_GOV_FABRIC.json) | Full pipeline template with its activity and parameters. [pipeline-content.json](pipeline-content.json) is the same configuration in Fabric REST definition format. |
 
-The installer accepts a blank pipeline, the inactive `Set variable1` draft, or a pipeline already using its loader activity. It checks for a changed definition before updating and does not start an ingestion run.
+## Wire it up once in Fabric
 
-## Manual setup using the JSON templates
+1. In the workspace containing `PLN_SAM_GOV_FABRIC`, select **Import > Notebook** and choose `sam-contract-awards.ipynb`. Use PySpark and attach your destination Lakehouse as the notebook's default. If needed, select **Toggle parameter cell** on the first code cell.
+2. Open `PLN_SAM_GOV_FABRIC`. Replace the inactive **Set variable1** with a **Notebook** activity named **Download SAM.gov Awards and IDVs**. In **Settings**, select the imported notebook. Selecting it in Fabric binds the notebook and workspace IDs.
+3. On the pipeline canvas, create these String pipeline parameters and use the corresponding dynamic expressions under the Notebook activity's **Base parameters**.
 
-1. In the target Fabric workspace, import `sam-contract-awards.ipynb` as a PySpark notebook and attach the destination Lakehouse as its default. Mark the configuration cell as the parameter cell if Fabric does not retain that designation.
-2. Store the SAM.gov API key in Azure Key Vault. Grant the notebook's run identity permission to get the secret and write to the Lakehouse. Do not put the key into the pipeline JSON.
-3. Replace the workspace and notebook placeholders with the actual Fabric IDs. In the full editor JSON, replace `<FABRIC_PIPELINE_ID>` with the ID of the existing pipeline. The notebook ID is the ID of the imported notebook, separate from the pipeline object ID.
-4. Use `PLN_SAM_GOV_FABRIC.json` for the full editor-shaped definition of the existing pipeline. For a Fabric REST activity definition, use `pipeline-content.json` as the InlineBase64 payload part of the same name. To update the existing item, call its updateDefinition endpoint using the target workspace and pipeline IDs. If required by your deployment process, preserve the existing item's `.platform` part obtained from getDefinition.
-5. Start a test run with `signed_from` and `signed_to` as ISO dates, `key_vault_url` as the vault endpoint, and `secret_name` as the Key Vault secret name. Use a small window with known Award and IDV records. Check both files and the completion marker before scheduling. The signed-date range is for bounded pulls and backfills. It does not collect updates to older contracts.
+| Pipeline and notebook parameter | Notebook activity expression | Run value |
+| --- | --- | --- |
+| `signed_from` | `@pipeline().parameters.signed_from` | Start date in `YYYY-MM-DD` |
+| `signed_to` | `@pipeline().parameters.signed_to` | End date in `YYYY-MM-DD` |
+| `key_vault_url` | `@pipeline().parameters.key_vault_url` | The Azure Key Vault endpoint |
+| `secret_name` | `@pipeline().parameters.secret_name` | Default `sam-gov-api-key` |
 
-[Fabric pipeline definition](https://learn.microsoft.com/rest/api/fabric/articles/item-management/definitions/datapipeline-definition) · [Update pipeline definition](https://learn.microsoft.com/rest/api/fabric/datapipeline/items/update-data-pipeline-definition) · [SAM.gov Contract Awards API](https://open.gsa.gov/api/contract-awards/)
+4. Store the API key in the Key Vault secret. The notebook's run identity needs secret-read and Lakehouse write access. Select **Save > Run** from the pipeline and enter the date range and vault URL.
+
+Check **Lakehouse > Files > raw > sam > contract-awards**. Each completed run has separate Award and IDV files and a `_SUCCESS.json` marker. The notebook preserves CSV or ZIP files returned by SAM.gov.
+
+[Fabric Notebook activity](https://learn.microsoft.com/en-us/fabric/data-factory/notebook-activity) · [Fabric pipeline JSON schema](https://learn.microsoft.com/rest/api/fabric/articles/item-management/definitions/datapipeline-definition) · [SAM.gov Contract Awards API](https://open.gsa.gov/api/contract-awards/)
