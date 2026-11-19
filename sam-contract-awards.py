@@ -11,10 +11,10 @@
 
 # PARAMETERS CELL ********************
 
-# An empty end date uses the UTC date of the first run for this start date.
-signed_from = "1978-10-01"
-signed_to = ""
-max_api_requests = 10
+# Inclusive dates. Start with the range that returned HTTP 200 in Fabric.
+signed_from = "2026-06-01"
+signed_to = "2026-06-05"
+max_api_requests = 2
 
 # METADATA ********************
 
@@ -25,130 +25,75 @@ max_api_requests = 10
 
 # CELL ********************
 
-# Paste your SAM.gov API key between the quotes in your private Fabric notebook.
+# Paste the active SAM.gov Public API Key in this private Fabric notebook.
 sam_api_key = ""
 
+import hashlib
 import json
+from collections import deque
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from shutil import copyfileobj
-from time import sleep
 from uuid import uuid4
 
 import requests
 
-API_ROOT = "https://api.sam.gov/contract-awards/v1"
+SEARCH_URL = "https://api.sam.gov/contract-awards/v1/search"
 LAKEHOUSE_FILES = Path("/lakehouse/default/Files")
-POLL_DELAYS = (30, 90, 180, 300)
+PAGE_SIZE = 100
+MAX_SEARCH_RECORDS = 400_000
 
 
-class BackfillPaused(Exception):
-    """The run can continue later from the saved partitions."""
+class LoadPaused(Exception):
+    """Saved pages can be resumed on a later run."""
 
 
-class ExtractTooLarge(Exception):
-    """SAM.gov requires a smaller date range."""
-
-
-class SamClient:
+class SamSearch:
     def __init__(self, session, api_key, request_limit):
         self.session = session
         self.api_key = api_key
         self.remaining = request_limit
 
-    def get(self, endpoint, params, *, stream=False):
+    def page(self, kind, start, end, offset):
+        if not self.remaining:
+            raise LoadPaused("The notebook used its request budget. Rerun to resume.")
+
         self.remaining -= 1
+        params = {
+            "api_key": self.api_key,
+            "awardOrIDV": kind,
+            "dateSigned": f"[{start:%m/%d/%Y},{end:%m/%d/%Y}]",
+            "limit": PAGE_SIZE,
+        }
+        if offset:
+            params["offset"] = offset
+
         try:
-            response = self.session.get(
-                f"{API_ROOT}/{endpoint}",
-                params={**params, "api_key": self.api_key},
-                timeout=(15, 120),
-                stream=stream,
-                allow_redirects=False,
-            )
+            with self.session.get(
+                SEARCH_URL, params=params, timeout=(15, 90), allow_redirects=False
+            ) as response:
+                status = response.status_code
+                if status == 204:
+                    return [], 0
+                if status == 429:
+                    raise LoadPaused("SAM.gov rate-limited the request. Resume after the allowance resets.")
+                if status != 200:
+                    raise RuntimeError(
+                        f"{kind} {start} through {end}: JSON search returned HTTP {status}."
+                    )
+                try:
+                    body = response.json()
+                    total = int(body["totalRecords"])
+                    records = body.get("awardSummary", [] if total == 0 else None)
+                except (TypeError, KeyError, ValueError, AttributeError):
+                    raise RuntimeError("SAM.gov returned an unexpected JSON response.") from None
         except requests.RequestException:
-            raise RuntimeError(f"SAM.gov {endpoint} request failed.") from None
-        if response.status_code == 429:
-            response.close()
-            raise BackfillPaused("SAM.gov rate limit reached. Resume after the limit resets.")
-        return response
+            raise RuntimeError(f"No usable response from SAM.gov for {kind}.") from None
 
-
-def response_text(response):
-    try:
-        return response.text.lower()
-    except requests.RequestException:
-        raise RuntimeError("Could not read the SAM.gov export status.") from None
-
-
-def request_export(client, kind, start, end):
-    params = {
-        "awardOrIDV": kind,
-        "dateSigned": f"[{start:%m/%d/%Y},{end:%m/%d/%Y}]",
-        "format": "csv",
-    }
-    with client.get("search", params) as response:
-        if response.status_code == 204:
-            return None
-        if response.status_code == 400:
-            error = response_text(response)
-            if "count exceeded error" in error or "exceeded the maximum allowable limit" in error:
-                raise ExtractTooLarge()
-        if response.status_code not in (200, 202):
-            raise RuntimeError(f"{kind} {start} to {end}: export request returned HTTP {response.status_code}.")
-        try:
-            token = response.json().get("exportToken")
-        except (ValueError, AttributeError):
-            token = None
-        if not isinstance(token, str) or not token:
-            raise RuntimeError(f"SAM.gov did not return an export token for {kind} {start} to {end}.")
-        return token
-
-
-def download_export(client, kind, token, folder):
-    for delay in POLL_DELAYS:
-        sleep(delay)
-        with client.get("download", {"token": token}, stream=True) as response:
-            if response.status_code == 202:
-                continue
-            if response.status_code == 400 and "file is not generated yet" in response_text(response):
-                continue
-            if response.status_code != 200:
-                raise RuntimeError(f"{kind} download returned HTTP {response.status_code}.")
-
-            content_type = response.headers.get("Content-Type", "").partition(";")[0].strip().lower()
-            if content_type == "application/json":
-                message = response_text(response)
-                if "file is not generated yet" in message or "generation is in progress" in message:
-                    continue
-                raise RuntimeError(f"SAM.gov returned a status response instead of the {kind} extract.")
-
-            response.raw.decode_content = True
-            staged = folder / f"{kind.lower()}.part"
-            try:
-                prefix = response.raw.read(512)
-                first_line = prefix.lstrip(b"\xef\xbb\xbf \t\r\n").partition(b"\n")[0]
-                if prefix.startswith((b"PK\x03\x04", b"PK\x05\x06")):
-                    extension = "zip"
-                elif content_type in (
-                    "", "text/csv", "application/csv", "text/plain",
-                    "application/octet-stream", "application/vnd.ms-excel",
-                ) and b"," in first_line and not first_line.startswith((b"{", b"<", b"[")):
-                    extension = "csv"
-                else:
-                    raise ValueError("Unexpected extract format.")
-
-                folder.mkdir(parents=True, exist_ok=True)
-                with staged.open("wb") as output:
-                    output.write(prefix)
-                    copyfileobj(response.raw, output, length=1024 * 1024)
-                target = folder / f"{kind.lower()}.{extension}"
-                staged.replace(target)
-                return target
-            except Exception:
-                staged.unlink(missing_ok=True)
-                raise RuntimeError(f"Could not save a complete CSV or ZIP for {kind}.") from None
-    raise BackfillPaused(f"The {kind} export was still pending. Completed windows are saved.")
+        if total < 0 or not isinstance(records, list) or not all(
+            isinstance(record, dict) for record in records
+        ):
+            raise RuntimeError("SAM.gov returned an unexpected awardSummary or totalRecords value.")
+        return records, total
 
 # METADATA ********************
 
@@ -159,77 +104,94 @@ def download_export(client, kind, token, folder):
 
 # CELL ********************
 
-def write_json(path, payload):
+def write_json_file(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
-    staged = path.with_name(f".{path.name}.{uuid4().hex}.part")
+    temporary = path.with_name(f".{uuid4().hex}.part")
     try:
-        staged.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        staged.replace(path)
+        temporary.write_text(json.dumps(value, ensure_ascii=False), encoding="utf-8")
+        temporary.replace(path)
     finally:
-        staged.unlink(missing_ok=True)
+        temporary.unlink(missing_ok=True)
 
 
-def snapshot_end(state, start, now):
-    if signed_to.strip():
-        return date.fromisoformat(signed_to.strip())
-
-    path = state / f"snapshot-from-{start}.json"
-    if path.exists():
-        return date.fromisoformat(json.loads(path.read_text(encoding="utf-8"))["signed_to"])
-    end = now.date()
-    if end >= start:
-        write_json(path, {"signed_to": str(end)})
-    return end
-
-
-def month_windows(start, end):
+def signed_months(start, end):
     while end >= start:
         low = max(start, end.replace(day=1))
         yield low, end
+        if low == start:
+            break
         end = low - timedelta(days=1)
 
 
-def load_window(client, root, state, run_dir, kind, start, end):
-    partition = f"record_type={kind.lower()}/signed_from={start}/signed_to={end}"
-    checkpoint = state / partition / "status.json"
-    previous = json.loads(checkpoint.read_text(encoding="utf-8")) if checkpoint.exists() else {}
-    status = previous.get("status")
-    if status == "empty":
-        return
-    if status == "saved":
-        file = root / previous["path"]
-        if file.is_file() and file.stat().st_size == previous["bytes"]:
-            return
+def split_window(kind, start, end):
+    if start == end:
+        raise RuntimeError(f"{kind} {start} exceeded SAM.gov's search limit for one day.")
+    middle = start + (end - start) // 2
+    return [(kind, middle + timedelta(days=1), end), (kind, start, middle)]
 
-    if status != "split":
-        # Reserve the request and all its download polls before starting a window.
-        if client.remaining < 1 + len(POLL_DELAYS):
-            raise BackfillPaused("Notebook request budget reached. Rerun to continue.")
-        try:
-            token = request_export(client, kind, start, end)
-        except ExtractTooLarge:
-            if start == end:
-                raise RuntimeError(f"{kind} {start} exceeds SAM.gov's extract limit even for one day.") from None
-            write_json(checkpoint, {"status": "split"})
-        else:
-            if token is None:
-                write_json(checkpoint, {"status": "empty"})
-                return
 
-            file = download_export(client, kind, token, run_dir / partition)
-            relative = file.relative_to(root).as_posix()
-            write_json(checkpoint, {
-                "status": "saved",
-                "path": relative,
-                "bytes": file.stat().st_size,
-                "downloaded_utc": datetime.now(timezone.utc).isoformat(),
-            })
-            print(f"Saved {relative}")
-            return
+def land_page(client, root, run, kind, start, end):
+    window = f"signed_from={start}/signed_to={end}"
+    marker = root / "_checkpoints/json_search" / window / f"{kind.lower()}.json"
+    previous = json.loads(marker.read_text(encoding="utf-8")) if marker.is_file() else {}
+    if previous.get("complete"):
+        return []
+    if previous.get("split"):
+        return split_window(kind, start, end)
 
-    midpoint = start + (end - start) // 2
-    load_window(client, root, state, run_dir, kind, midpoint + timedelta(days=1), end)
-    load_window(client, root, state, run_dir, kind, start, midpoint)
+    page = previous.get("next_page", 0)
+    offset = previous.get("next_offset", page)
+    records, total = client.page(kind, start, end, offset)
+    if page and total != previous["total"]:
+        raise RuntimeError(
+            f"{kind} {start} through {end}: the match count changed during paging. "
+            "The saved pages are available. Use a different signed-date range for a new load."
+        )
+    if total > MAX_SEARCH_RECORDS:
+        children = split_window(kind, start, end)
+        write_json_file(marker, {"split": True})
+        return children
+
+    fingerprint = hashlib.sha256(
+        json.dumps(records, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+    if records and fingerprint == previous.get("last_page_sha256"):
+        if page == 1 and offset == 1:
+            # Some responses treat offset 1 as the first page when offset is omitted.
+            write_json_file(marker, {**previous, "next_offset": 2})
+            return [(kind, start, end)]
+        raise RuntimeError(f"{kind}: SAM.gov repeated the previous page. Saved progress was kept.")
+
+    expected = min(PAGE_SIZE, max(0, total - page * PAGE_SIZE))
+    if len(records) != expected:
+        raise RuntimeError(
+            f"{kind} page {page} contained {len(records)} records. "
+            f"The reported total implies {expected}. Saved progress was kept."
+        )
+
+    if records:
+        target = run / f"record_type={kind.lower()}" / window / f"page-{page:04d}.json"
+        write_json_file(target, {
+            "awardSummary": records,
+            "totalRecords": total,
+            "offset": offset,
+            "limit": PAGE_SIZE,
+        })
+        print(f"Saved {len(records):,} {kind} records to {target.relative_to(LAKEHOUSE_FILES).as_posix()}")
+
+    complete = page * PAGE_SIZE + len(records) == total
+    write_json_file(marker, {
+        "next_page": page + 1,
+        "next_offset": offset + 1,
+        "total": total,
+        "complete": complete,
+        "last_page_sha256": fingerprint,
+    })
+    if complete:
+        if total == 0:
+            print(f"No {kind} records for {start} through {end}.")
+        return []
+    return [(kind, start, end)]
 
 # METADATA ********************
 
@@ -241,36 +203,34 @@ def load_window(client, root, state, run_dir, kind, start, end):
 # CELL ********************
 
 def ingest():
+    key = sam_api_key.strip()
+    if not key:
+        raise ValueError("Enter the SAM.gov key in sam_api_key in the second code cell.")
     if not LAKEHOUSE_FILES.is_dir():
-        raise RuntimeError("Attach the intended Lakehouse as the default Lakehouse.")
+        raise RuntimeError("Attach the destination Lakehouse as this notebook's default Lakehouse.")
 
-    api_key = sam_api_key.strip()
-    if not api_key:
-        raise ValueError("Enter the SAM.gov API key in sam_api_key in the second code cell.")
-
+    start = date.fromisoformat(signed_from.strip())
+    end = date.fromisoformat(signed_to.strip())
     request_limit = int(max_api_requests)
-    if request_limit < 1 + len(POLL_DELAYS):
-        raise ValueError("max_api_requests must be at least 5.")
+    if start > end or request_limit < 1:
+        raise ValueError("Check the signed-date range and request budget in the first code cell.")
 
     now = datetime.now(timezone.utc)
-    root = LAKEHOUSE_FILES / "raw" / "sam" / "contract-awards"
-    state = root / "_checkpoints"
-    start = date.fromisoformat(signed_from.strip() or "1978-10-01")
-    end = snapshot_end(state, start, now)
-    if start > end:
-        raise ValueError("signed_from must be on or before signed_to.")
+    root = LAKEHOUSE_FILES / "raw/sam/contract-awards"
+    run = root / f"ingested_date={now:%Y-%m-%d}" / f"run={now:%Y%m%dT%H%M%SZ}-{uuid4().hex[:12]}" / "source=json_search"
 
-    run_dir = root / f"ingested_date={now:%Y-%m-%d}" / f"run={now:%Y%m%dT%H%M%SZ}-{uuid4().hex}"
     status = "complete"
     with requests.Session() as session:
-        client = SamClient(session, api_key, request_limit)
+        client = SamSearch(session, key, request_limit)
         try:
-            for low, high in month_windows(start, end):
-                for kind in ("Award", "IDV"):
-                    load_window(client, root, state, run_dir, kind, low, high)
-        except BackfillPaused as pause:
+            for low, high in signed_months(start, end):
+                pending = deque((kind, low, high) for kind in ("Award", "IDV"))
+                while pending:
+                    kind, window_start, window_end = pending.popleft()
+                    pending.extend(land_page(client, root, run, kind, window_start, window_end))
+        except LoadPaused as paused:
             status = "paused"
-            print(pause)
+            print(paused)
 
     receipt = {
         "status": status,
@@ -279,10 +239,11 @@ def ingest():
         "ingested_utc": now.isoformat(),
         "api_requests": request_limit - client.remaining,
     }
-    write_json(run_dir / "_RUN.json", receipt)
+    write_json_file(run / "_RUN.json", receipt)
     if status == "complete":
-        write_json(run_dir / "_SUCCESS.json", receipt)
-    print(f"Backfill {status}. Run folder: {run_dir.relative_to(LAKEHOUSE_FILES).as_posix()}")
+        write_json_file(run / "_SUCCESS.json", receipt)
+
+    print(f"Run {status}. Lakehouse folder: Files/{run.relative_to(LAKEHOUSE_FILES).as_posix()}")
 
 
 ingest()
