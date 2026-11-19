@@ -1,104 +1,22 @@
-name: Probe SAM.gov contract headers
+name: Verify published SAM.gov contract headers
 
 on: workflow_dispatch
 
-permissions: {}
+permissions:
+  contents: read
 
 jobs:
-  sam-headers:
+  verify:
     runs-on: ubuntu-latest
-    timeout-minutes: 4
+    timeout-minutes: 6
     steps:
-      - name: Search for Award and IDV headers
-        env:
-          SAM_API_KEY: ${{ secrets.SAM_GOV_HEADER_PROBE_KEY }}
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install PDF table reader
+        run: python3 -m pip install --disable-pip-version-check pdfplumber==0.11.9
+      - name: Rebuild header samples from GSA and verify the committed files
         run: |
-          python3 - <<'PY'
-          import json
-          import os
-          import re
-          import urllib.error
-          import urllib.parse
-          import urllib.request
-
-          url = "https://api.sam.gov/contract-awards/v1/search"
-          key = os.environ.get("SAM_API_KEY", "").strip()
-          if not key:
-              print('SAM_PROBE {"status":"missing_runner_secret"}')
-              raise SystemExit(1)
-
-          class NoRedirect(urllib.request.HTTPRedirectHandler):
-              def redirect_request(self, request, fp, code, msg, headers, newurl):
-                  return None
-
-          opener = urllib.request.build_opener(NoRedirect())
-
-          def category(body, media):
-              text = body.decode("utf-8", "replace").lower()
-              checks = {
-                  "invalid api key": "invalid_key",
-                  "invalid api_key": "invalid_key",
-                  "disabled api key": "disabled_key",
-                  "over_rate_limit": "rate_limit",
-                  "not authorized to access": "permission_denied",
-                  "dates must be specified": "date_format",
-                  "count exceeded error": "extract_size_limit",
-              }
-              for fragment, label in checks.items():
-                  if fragment in text:
-                      return label
-              return "html_response" if media == "text/html" else "unclassified"
-
-          def fields(value, prefix=""):
-              if isinstance(value, dict):
-                  for name, child in value.items():
-                      if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,127}", name) and key not in name:
-                          if name.lower() not in {"api_key", "apikey", "exporttoken", "presignedurl"}:
-                              yield from fields(child, f"{prefix}.{name}" if prefix else name)
-              elif isinstance(value, list):
-                  yield prefix
-                  for child in value:
-                      yield from fields(child, prefix + "[]")
-              elif prefix:
-                  yield prefix
-
-          def probe(kind, window, export=False):
-              result = {"mode": "csv_export" if export else "json_search", "kind": kind, "signed_dates": window}
-              query = {"awardOrIDV": kind, "dateSigned": window, "api_key": key}
-              query.update({"format": "csv"} if export else {"limit": 1})
-              request = urllib.request.Request(url + "?" + urllib.parse.urlencode(query))
-              try:
-                  with opener.open(request, timeout=25) as response:
-                      result["http"] = response.status
-                      if response.status == 204:
-                          result["status"] = "no_records"
-                      else:
-                          body = json.load(response)
-                          if export:
-                              result["status"] = "export_token_returned" if body.get("exportToken") else "unexpected_export_response"
-                          else:
-                              records = body.get("awardSummary")
-                              if isinstance(records, list) and records and isinstance(records[0], dict):
-                                  result.update(status="observed", records_sampled=1, fields=sorted(set(fields(records[0]))))
-                              else:
-                                  result["status"] = "unexpected_search_response"
-              except urllib.error.HTTPError as error:
-                  with error:
-                      result.update(http=error.code, status=category(error.read(8192), error.headers.get_content_type()))
-              except (TimeoutError, urllib.error.URLError):
-                  result["status"] = "no_usable_http_response"
-              except (ValueError, TypeError, AttributeError):
-                  result["status"] = "unexpected_response"
-              print("SAM_PROBE " + json.dumps(result, sort_keys=True), flush=True)
-              return result
-
-          window = "[06/01/2026,06/05/2026]"
-          award = probe("Award", window)
-          if award.get("http") in {401, 403, 429} or award["status"] == "rate_limit":
-              raise SystemExit(1)
-          idv = probe("IDV", window)
-          if award["status"] == "observed" and idv.get("http") != 429:
-              probe("Award", window, export=True)
-          if award["status"] != "observed" and idv["status"] != "observed":
-              raise SystemExit(1)
-          PY
+          python3 scripts/generate-sam-headers.py --output-dir "$RUNNER_TEMP/sam-headers"
+          cmp samples/sam-award-idv-headers.csv "$RUNNER_TEMP/sam-headers/sam-award-idv-headers.csv"
+          cmp samples/sam-award-idv-field-map.csv "$RUNNER_TEMP/sam-headers/sam-award-idv-field-map.csv"
