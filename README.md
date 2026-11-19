@@ -6,18 +6,19 @@ The PySpark notebook lands separate Award and IDV extracts in the default Lakeho
 
 1. Import [sam-contract-awards.ipynb](sam-contract-awards.ipynb) as a PySpark notebook, or copy the four cells from the [Python source](sam-contract-awards.py). Attach the destination Lakehouse as the default.
 2. In the second code cell of your private Fabric notebook, paste the SAM.gov API key between the quotes on the sam_api_key line. Keep Git and shared copies free of the key.
-3. Select **Run all**. The default range starts October 1, 1978 and ends on the UTC date of the first run. The notebook processes the newest month first. Set `signed_from` and `signed_to` to use a specific inclusive range.
+3. Select **Run all**. The notebook loads records signed November 20, 2025 through November 19, 2026, starting with the newest month. Keep `signed_from` and `signed_to` fixed when resuming this load.
 
-The notebook saves the original CSV or ZIP extracts under this hierarchy.
+The notebook saves pages from the SAM.gov Contract Awards JSON search under this hierarchy.
 
     Files/raw/sam/contract-awards/
       ingested_date=YYYY-MM-DD/
         run=YYYYMMDDTHHMMSSZ-<run-id>/
-          record_type=award/signed_from=YYYY-MM-DD/signed_to=YYYY-MM-DD/award.csv
-          record_type=idv/signed_from=YYYY-MM-DD/signed_to=YYYY-MM-DD/idv.csv
-          _RUN.json
+          source=json_search/
+            record_type=award/signed_from=YYYY-MM-DD/signed_to=YYYY-MM-DD/page-0000.json
+            record_type=idv/signed_from=YYYY-MM-DD/signed_to=YYYY-MM-DD/page-0000.json
+            _RUN.json
 
-Rerun with the same date range to resume. Completed and empty windows are tracked in `_checkpoints`. Oversized extracts are split into smaller signed-date windows. The notebook defaults to 10 API requests per run. Resume after the account's allowance resets if SAM.gov rate-limits the run. A paused run preserves saved files. `_SUCCESS.json` appears only once the requested date range is complete for both types.
+Rerun with the same date range to resume. Completed and empty windows are tracked in `_checkpoints`. When a signed-date window exceeds the search limit, the notebook splits it into smaller windows. The notebook defaults to 10 API requests per run. Resume after the account's allowance resets if SAM.gov rate-limits the run. A paused run preserves saved files. `_SUCCESS.json` appears only once the requested date range is complete for both types.
 
 ## Run from a Fabric pipeline
 
