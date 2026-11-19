@@ -10,11 +10,12 @@
 
 # PARAMETERS CELL ********************
 
-# Set this as the parameter cell when running from a Fabric pipeline.
-signed_from = ""
+# An empty end date uses the UTC date of the first run for this start date.
+signed_from = "1978-10-01"
 signed_to = ""
 key_vault_url = ""
 secret_name = "sam-gov-api-key"
+max_api_requests = 10
 
 # METADATA ********************
 
@@ -25,126 +26,266 @@ secret_name = "sam-gov-api-key"
 
 # CELL ********************
 
-from datetime import date
+import json
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from shutil import copyfileobj
 from time import sleep
 from uuid import uuid4
-import json
 
 import requests
 
+# Fill this only in a private notebook, or supply key_vault_url for Key Vault.
+sam_api_key = ""
+
 API_ROOT = "https://api.sam.gov/contract-awards/v1"
 LAKEHOUSE_FILES = Path("/lakehouse/default/Files")
-POLL_DELAYS = (30, 60, 120, 180)
+POLL_DELAYS = (30, 90, 180, 300)
 
 
-def request_sam(session, endpoint, params, stream=False):
+class BackfillPaused(Exception):
+    """The run can continue later from the saved partitions."""
+
+
+class ExtractTooLarge(Exception):
+    """SAM.gov requires a smaller date range."""
+
+
+class SamClient:
+    def __init__(self, session, api_key, request_limit):
+        self.session = session
+        self.api_key = api_key
+        self.remaining = request_limit
+
+    def get(self, endpoint, params, *, stream=False):
+        self.remaining -= 1
+        try:
+            response = self.session.get(
+                f"{API_ROOT}/{endpoint}",
+                params={**params, "api_key": self.api_key},
+                timeout=(15, 120),
+                stream=stream,
+                allow_redirects=False,
+            )
+        except requests.RequestException:
+            raise RuntimeError(f"SAM.gov {endpoint} request failed.") from None
+        if response.status_code == 429:
+            response.close()
+            raise BackfillPaused("SAM.gov rate limit reached. Resume after the limit resets.")
+        return response
+
+
+def response_text(response):
     try:
-        response = session.get(
-            f"{API_ROOT}/{endpoint}",
-            params=params,
-            timeout=(15, 90),
-            stream=stream,
-            allow_redirects=False,
-        )
+        return response.text.lower()
     except requests.RequestException:
-        raise RuntimeError(f"SAM.gov {endpoint} request failed before a response.") from None
-    return response
+        raise RuntimeError("Could not read the SAM.gov export status.") from None
 
 
-def request_extract(session, api_key, record_type, signed_range):
+def request_export(client, kind, start, end):
     params = {
-        "api_key": api_key,
-        "awardOrIDV": record_type,
-        "dateSigned": signed_range,
+        "awardOrIDV": kind,
+        "dateSigned": f"[{start:%m/%d/%Y},{end:%m/%d/%Y}]",
         "format": "csv",
     }
-    with request_sam(session, "search", params) as response:
+    with client.get("search", params) as response:
+        if response.status_code == 204:
+            return None
+        if response.status_code == 400:
+            error = response_text(response)
+            if "count exceeded error" in error or "exceeded the maximum allowable limit" in error:
+                raise ExtractTooLarge()
         if response.status_code not in (200, 202):
-            raise RuntimeError(f"{record_type} extract request returned HTTP {response.status_code}.")
+            raise RuntimeError(f"{kind} {start} to {end}: export request returned HTTP {response.status_code}.")
         try:
             token = response.json().get("exportToken")
         except (ValueError, AttributeError):
             token = None
         if not isinstance(token, str) or not token:
-            raise RuntimeError(f"SAM.gov did not return an export token for {record_type}.")
+            raise RuntimeError(f"SAM.gov did not return an export token for {kind} {start} to {end}.")
         return token
 
 
-def save_extract(session, api_key, token, record_type, folder):
-    params = {"api_key": api_key, "token": token}
+def download_export(client, kind, token, folder):
     for delay in POLL_DELAYS:
         sleep(delay)
-        with request_sam(session, "download", params, stream=True) as response:
-            media_type = response.headers.get("Content-Type", "").split(";")[0].strip().lower()
-            if response.status_code == 202 or (
-                response.status_code == 200 and media_type == "application/json"
-            ):
+        with client.get("download", {"token": token}, stream=True) as response:
+            if response.status_code == 202:
                 continue
-            if response.status_code == 400:
-                # SAM.gov uses HTTP 400 for an extract that is still being generated.
-                try:
-                    pending = "file is not generated yet" in response.text.lower()
-                except requests.RequestException:
-                    raise RuntimeError(f"Could not read the {record_type} export status.") from None
-                if pending:
-                    continue
+            if response.status_code == 400 and "file is not generated yet" in response_text(response):
+                continue
             if response.status_code != 200:
-                raise RuntimeError(f"{record_type} download returned HTTP {response.status_code}.")
+                raise RuntimeError(f"{kind} download returned HTTP {response.status_code}.")
+
+            content_type = response.headers.get("Content-Type", "").partition(";")[0].strip().lower()
+            if content_type == "application/json":
+                message = response_text(response)
+                if "file is not generated yet" in message or "generation is in progress" in message:
+                    continue
+                raise RuntimeError(f"SAM.gov returned a status response instead of the {kind} extract.")
 
             response.raw.decode_content = True
+            staged = folder / f"{kind.lower()}.part"
             try:
                 prefix = response.raw.read(512)
+                first_line = prefix.lstrip(b"\xef\xbb\xbf \t\r\n").partition(b"\n")[0]
                 if prefix.startswith((b"PK\x03\x04", b"PK\x05\x06")):
                     extension = "zip"
-                elif media_type in ("text/csv", "application/csv", "application/octet-stream", "text/plain") and (
-                    b"," in prefix.partition(b"\n")[0]
-                ) and not prefix.lstrip(b"\xef\xbb\xbf \t\r\n").startswith((b"<", b"{", b"[")):
+                elif content_type in (
+                    "", "text/csv", "application/csv", "text/plain",
+                    "application/octet-stream", "application/vnd.ms-excel",
+                ) and b"," in first_line and not first_line.startswith((b"{", b"<", b"[")):
                     extension = "csv"
                 else:
-                    raise RuntimeError(f"SAM.gov did not return a CSV or ZIP for {record_type}.")
+                    raise ValueError("Unexpected extract format.")
 
-                target = folder / f"{record_type.lower()}.{extension}"
-                with target.open("xb") as output:
+                folder.mkdir(parents=True, exist_ok=True)
+                with staged.open("wb") as output:
                     output.write(prefix)
                     copyfileobj(response.raw, output, length=1024 * 1024)
-            except RuntimeError:
-                raise
+                target = folder / f"{kind.lower()}.{extension}"
+                staged.replace(target)
+                return target
             except Exception:
-                raise RuntimeError(f"Could not finish writing the {record_type} extract.") from None
+                staged.unlink(missing_ok=True)
+                raise RuntimeError(f"Could not save a complete CSV or ZIP for {kind}.") from None
+    raise BackfillPaused(f"The {kind} export was still pending. Completed windows are saved.")
 
-            return {"file": target.name, "bytes": target.stat().st_size}
-    raise TimeoutError(f"The {record_type} extract was not ready within the polling budget.")
+# METADATA ********************
 
+# META {
+# META   "language": "python",
+# META   "language_group": "synapse_pyspark"
+# META }
+
+# CELL ********************
+
+def write_json(path, payload):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    staged = path.with_name(f".{path.name}.{uuid4().hex}.part")
+    try:
+        staged.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        staged.replace(path)
+    finally:
+        staged.unlink(missing_ok=True)
+
+
+def snapshot_end(state, start, now):
+    if signed_to.strip():
+        return date.fromisoformat(signed_to.strip())
+
+    path = state / f"snapshot-from-{start}.json"
+    if path.exists():
+        return date.fromisoformat(json.loads(path.read_text(encoding="utf-8"))["signed_to"])
+    end = now.date()
+    if end >= start:
+        write_json(path, {"signed_to": str(end)})
+    return end
+
+
+def month_windows(start, end):
+    while end >= start:
+        low = max(start, end.replace(day=1))
+        yield low, end
+        end = low - timedelta(days=1)
+
+
+def load_window(client, root, state, run_dir, kind, start, end):
+    partition = f"record_type={kind.lower()}/signed_from={start}/signed_to={end}"
+    checkpoint = state / partition / "status.json"
+    previous = json.loads(checkpoint.read_text(encoding="utf-8")) if checkpoint.exists() else {}
+    status = previous.get("status")
+    if status == "empty":
+        return
+    if status == "saved":
+        file = root / previous["path"]
+        if file.is_file() and file.stat().st_size == previous["bytes"]:
+            return
+
+    if status != "split":
+        # Reserve the request and all its download polls before starting a window.
+        if client.remaining < 1 + len(POLL_DELAYS):
+            raise BackfillPaused("Notebook request budget reached. Rerun to continue.")
+        try:
+            token = request_export(client, kind, start, end)
+        except ExtractTooLarge:
+            if start == end:
+                raise RuntimeError(f"{kind} {start} exceeds SAM.gov's extract limit even for one day.") from None
+            write_json(checkpoint, {"status": "split"})
+        else:
+            if token is None:
+                write_json(checkpoint, {"status": "empty"})
+                return
+
+            file = download_export(client, kind, token, run_dir / partition)
+            relative = file.relative_to(root).as_posix()
+            write_json(checkpoint, {
+                "status": "saved",
+                "path": relative,
+                "bytes": file.stat().st_size,
+                "downloaded_utc": datetime.now(timezone.utc).isoformat(),
+            })
+            print(f"Saved {relative}")
+            return
+
+    midpoint = start + (end - start) // 2
+    load_window(client, root, state, run_dir, kind, midpoint + timedelta(days=1), end)
+    load_window(client, root, state, run_dir, kind, start, midpoint)
+
+# METADATA ********************
+
+# META {
+# META   "language": "python",
+# META   "language_group": "synapse_pyspark"
+# META }
+
+# CELL ********************
 
 def ingest():
-    start, end = date.fromisoformat(signed_from), date.fromisoformat(signed_to)
+    if not LAKEHOUSE_FILES.is_dir():
+        raise RuntimeError("Attach the intended Lakehouse as the default Lakehouse.")
+
+    api_key = sam_api_key.strip()
+    if not api_key:
+        if not key_vault_url.strip():
+            raise ValueError("Set key_vault_url or enter the SAM.gov key in this private notebook.")
+        api_key = notebookutils.credentials.getSecret(key_vault_url.strip(), secret_name)
+
+    request_limit = int(max_api_requests)
+    if request_limit < 1 + len(POLL_DELAYS):
+        raise ValueError("max_api_requests must be at least 5.")
+
+    now = datetime.now(timezone.utc)
+    root = LAKEHOUSE_FILES / "raw" / "sam" / "contract-awards"
+    state = root / "_checkpoints"
+    start = date.fromisoformat(signed_from.strip() or "1978-10-01")
+    end = snapshot_end(state, start, now)
     if start > end:
         raise ValueError("signed_from must be on or before signed_to.")
-    if not key_vault_url:
-        raise ValueError("Set key_vault_url to your Azure Key Vault endpoint.")
-    if not LAKEHOUSE_FILES.is_dir():
-        raise RuntimeError("Attach the destination Lakehouse as the default Lakehouse.")
 
-    api_key = notebookutils.credentials.getSecret(key_vault_url, secret_name)
-    signed_range = f"[{start:%m/%d/%Y},{end:%m/%d/%Y}]"
-    folder = LAKEHOUSE_FILES / "raw/sam/contract-awards" / (
-        f"signed_from={start}/signed_to={end}/run={uuid4().hex}"
-    )
-    folder.mkdir(parents=True, exist_ok=False)
+    run_dir = root / f"ingested_date={now:%Y-%m-%d}" / f"run={now:%Y%m%dT%H%M%SZ}-{uuid4().hex}"
+    status = "complete"
     with requests.Session() as session:
-        tokens = {
-            kind: request_extract(session, api_key, kind, signed_range)
-            for kind in ("Award", "IDV")
-        }
-        files = {
-            kind: save_extract(session, api_key, token, kind, folder)
-            for kind, token in tokens.items()
-        }
-    manifest = {"signed_from": str(start), "signed_to": str(end), "files": files}
-    (folder / "_SUCCESS.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-    print(f"Saved both extracts under {folder.relative_to(LAKEHOUSE_FILES)}")
+        client = SamClient(session, api_key, request_limit)
+        try:
+            for low, high in month_windows(start, end):
+                for kind in ("Award", "IDV"):
+                    load_window(client, root, state, run_dir, kind, low, high)
+        except BackfillPaused as pause:
+            status = "paused"
+            print(pause)
+
+    receipt = {
+        "status": status,
+        "signed_from": str(start),
+        "signed_to": str(end),
+        "ingested_utc": now.isoformat(),
+        "api_requests": request_limit - client.remaining,
+    }
+    write_json(run_dir / "_RUN.json", receipt)
+    if status == "complete":
+        write_json(run_dir / "_SUCCESS.json", receipt)
+    print(f"Backfill {status}. Run folder: {run_dir.relative_to(LAKEHOUSE_FILES).as_posix()}")
 
 
 ingest()
