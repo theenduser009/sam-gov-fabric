@@ -1,0 +1,68 @@
+{
+  "properties": {
+    "description": "Download public SAM.gov Award and IDV extracts to the notebook's default Fabric Lakehouse.",
+    "parameters": {
+      "signed_from": {
+        "type": "String"
+      },
+      "signed_to": {
+        "type": "String"
+      },
+      "key_vault_url": {
+        "type": "String"
+      },
+      "secret_name": {
+        "type": "String",
+        "defaultValue": "sam-gov-api-key"
+      }
+    },
+    "activities": [
+      {
+        "name": "Download SAM.gov Awards and IDVs",
+        "type": "TridentNotebook",
+        "dependsOn": [],
+        "policy": {
+          "timeout": "0.00:40:00",
+          "retry": 0,
+          "retryIntervalInSeconds": 30,
+          "secureInput": true,
+          "secureOutput": true
+        },
+        "typeProperties": {
+          "notebookId": "<FABRIC_NOTEBOOK_ID>",
+          "workspaceId": "<FABRIC_WORKSPACE_ID>",
+          "parameters": {
+            "signed_from": {
+              "value": {
+                "value": "@pipeline().parameters.signed_from",
+                "type": "Expression"
+              },
+              "type": "string"
+            },
+            "signed_to": {
+              "value": {
+                "value": "@pipeline().parameters.signed_to",
+                "type": "Expression"
+              },
+              "type": "string"
+            },
+            "key_vault_url": {
+              "value": {
+                "value": "@pipeline().parameters.key_vault_url",
+                "type": "Expression"
+              },
+              "type": "string"
+            },
+            "secret_name": {
+              "value": {
+                "value": "@pipeline().parameters.secret_name",
+                "type": "Expression"
+              },
+              "type": "string"
+            }
+          }
+        }
+      }
+    ]
+  }
+}
