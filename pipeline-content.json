@@ -7,13 +7,6 @@
       },
       "signed_to": {
         "type": "String"
-      },
-      "key_vault_url": {
-        "type": "String"
-      },
-      "secret_name": {
-        "type": "String",
-        "defaultValue": "sam-gov-api-key"
       }
     },
     "activities": [
@@ -42,20 +35,6 @@
             "signed_to": {
               "value": {
                 "value": "@pipeline().parameters.signed_to",
-                "type": "Expression"
-              },
-              "type": "string"
-            },
-            "key_vault_url": {
-              "value": {
-                "value": "@pipeline().parameters.key_vault_url",
-                "type": "Expression"
-              },
-              "type": "string"
-            },
-            "secret_name": {
-              "value": {
-                "value": "@pipeline().parameters.secret_name",
                 "type": "Expression"
               },
               "type": "string"

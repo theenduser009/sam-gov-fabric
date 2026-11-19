@@ -5,7 +5,7 @@ The PySpark notebook lands separate Award and IDV extracts in the default Lakeho
 ## Run the notebook directly
 
 1. Import [sam-contract-awards.ipynb](sam-contract-awards.ipynb) as a PySpark notebook, or copy the four cells from the [Python source](sam-contract-awards.py). Attach the destination Lakehouse as the default.
-2. For a private manual run, enter the SAM.gov key into `sam_api_key` in the second code cell, or set `key_vault_url` in the first code cell to read the key from Key Vault. Keep shared and Git copies free of credentials.
+2. In the second code cell of your private Fabric notebook, paste the SAM.gov API key between the quotes on the sam_api_key line. Keep Git and shared copies free of the key.
 3. Select **Run all**. The default range starts October 1, 1978 and ends on the UTC date of the first run. The notebook processes the newest month first. Set `signed_from` and `signed_to` to use a specific inclusive range.
 
 The notebook saves the original CSV or ZIP extracts under this hierarchy.
@@ -31,9 +31,7 @@ Rerun with the same date range to resume. Completed and empty windows are tracke
 | --- | --- | --- |
 | `signed_from` | `@pipeline().parameters.signed_from` | Start date in `YYYY-MM-DD` |
 | `signed_to` | `@pipeline().parameters.signed_to` | End date in `YYYY-MM-DD` |
-| `key_vault_url` | `@pipeline().parameters.key_vault_url` | The Azure Key Vault endpoint |
-| `secret_name` | `@pipeline().parameters.secret_name` | Default `sam-gov-api-key` |
 
-4. Store the API key in the Key Vault secret. The notebook's run identity needs secret-read and Lakehouse write access. Select **Save > Run** from the pipeline and enter the date range and vault URL.
+4. Enter the SAM.gov key in the notebook before selecting **Save > Run** in the pipeline. The run identity needs Lakehouse write access. Enter the signed-date range at run time.
 
 [Fabric Notebook activity](https://learn.microsoft.com/en-us/fabric/data-factory/notebook-activity) · [Fabric pipeline JSON schema](https://learn.microsoft.com/rest/api/fabric/articles/item-management/definitions/datapipeline-definition) · [SAM.gov Contract Awards API](https://open.gsa.gov/api/contract-awards/)

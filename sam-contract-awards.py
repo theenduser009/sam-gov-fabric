@@ -1,4 +1,5 @@
 # Fabric notebook source
+# Prepared by Codex (OpenAI)
 
 # METADATA ********************
 
@@ -13,8 +14,6 @@
 # An empty end date uses the UTC date of the first run for this start date.
 signed_from = "1978-10-01"
 signed_to = ""
-key_vault_url = ""
-secret_name = "sam-gov-api-key"
 max_api_requests = 10
 
 # METADATA ********************
@@ -26,6 +25,9 @@ max_api_requests = 10
 
 # CELL ********************
 
+# Paste your SAM.gov API key between the quotes in your private Fabric notebook.
+sam_api_key = ""
+
 import json
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -34,9 +36,6 @@ from time import sleep
 from uuid import uuid4
 
 import requests
-
-# Fill this only in a private notebook, or supply key_vault_url for Key Vault.
-sam_api_key = ""
 
 API_ROOT = "https://api.sam.gov/contract-awards/v1"
 LAKEHOUSE_FILES = Path("/lakehouse/default/Files")
@@ -247,9 +246,7 @@ def ingest():
 
     api_key = sam_api_key.strip()
     if not api_key:
-        if not key_vault_url.strip():
-            raise ValueError("Set key_vault_url or enter the SAM.gov key in this private notebook.")
-        api_key = notebookutils.credentials.getSecret(key_vault_url.strip(), secret_name)
+        raise ValueError("Enter the SAM.gov API key in sam_api_key in the second code cell.")
 
     request_limit = int(max_api_requests)
     if request_limit < 1 + len(POLL_DELAYS):
